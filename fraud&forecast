@@ -1,0 +1,249 @@
+!pip -q install ccxt streamlit pyngrok plotly pandas scikit-learn ta tensorflow --quiet
+
+import os, time, random
+from pyngrok import ngrok
+import pandas as pd
+import numpy as np
+import ccxt
+from sklearn.ensemble import IsolationForest
+from sklearn.preprocessing import StandardScaler
+import ta
+from datetime import datetime, timedelta
+import tensorflow as tf
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import LSTM, Dense
+
+SYMBOL = "BTC/USDT"
+TIMEFRAME = "1h"
+HOURS = 24 * 30
+SEQ_LEN = 24
+NUM_PUMP_EVENTS = 6
+RANDOM_SEED = 42
+INJECT_FRAUD = True
+CONTAMINATION = 0.02
+PLAYBACK_SPEED = 0.25
+ROLLING_WINDOW = 50
+
+random.seed(RANDOM_SEED)
+np.random.seed(RANDOM_SEED)
+tf.random.set_seed(RANDOM_SEED)
+
+# Fetch or generate OHLCV data
+def fetch_binance_ohlcv(symbol=SYMBOL, timeframe=TIMEFRAME, limit=1000):
+    try:
+        exchange = ccxt.binance()
+        ohlcv = exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
+        df = pd.DataFrame(ohlcv, columns=['ts','open','high','low','close','volume'])
+        df['datetime'] = pd.to_datetime(df['ts'], unit='ms')
+        return df[['datetime','open','high','low','close','volume']]
+    except Exception as e:
+        print("ccxt fetch failed:", e)
+        return None
+
+df = fetch_binance_ohlcv(limit=HOURS)
+if df is None or len(df) < 200:
+    end = datetime.utcnow()
+    periods = HOURS
+    dates = [end - timedelta(hours=(periods - i)) for i in range(periods)]
+    price = 30000.0 + np.cumsum(np.random.normal(0, 100, size=periods))
+    vol = np.random.uniform(50, 500, size=periods)
+    df = pd.DataFrame({'datetime': dates, 'open': price, 'high': price*1.002, 'low': price*0.998, 'close': price, 'volume': vol})
+
+df_sim = df.copy().reset_index(drop=True)
+df_sim['is_injected_fraud'] = 0
+
+# Inject synthetic pump/dump fraud events
+if INJECT_FRAUD:
+    n = len(df_sim)
+    possible_idx = list(range(30, n-30))
+    random.shuffle(possible_idx)
+    injected = []
+    min_gap = SEQ_LEN + 12
+    for idx in possible_idx:
+        if len(injected) >= NUM_PUMP_EVENTS:
+            break
+        if all(abs(idx - j) > min_gap for j in injected):
+            injected.append(idx)
+    for idx in injected:
+        pump_len = random.choice([1,2,3])
+        mag = random.uniform(1.12, 1.6)
+        dump_len = pump_len + random.choice([1,2])
+        for j in range(pump_len):
+            i = min(idx + j, n-1)
+            base = df_sim.loc[i, 'close']
+            df_sim.loc[i, ['open','high','low','close']] = base * mag
+            df_sim.loc[i, 'is_injected_fraud'] = 1
+        for j in range(dump_len):
+            i = min(idx + pump_len + j, n-1)
+            base = df.loc[i, 'close']
+            df_sim.loc[i, ['open','high','low','close']] = base * random.uniform(0.6,0.95)
+            df_sim.loc[i, 'is_injected_fraud'] = 1
+        if random.random() < 0.4:
+            for j in range(-1,3):
+                i = min(max(idx + j, 0), n-1)
+                df_sim.loc[i, 'volume'] *= random.uniform(3,10)
+                df_sim.loc[i, 'is_injected_fraud'] = 1
+
+# Feature engineering
+df_feat = df_sim.copy()
+df_feat['rsi'] = ta.momentum.rsi(df_feat['close'], window=14).bfill()
+df_feat['ema20'] = ta.trend.ema_indicator(df_feat['close'], window=20).bfill()
+bb = ta.volatility.BollingerBands(df_feat['close'], window=20, window_dev=2)
+df_feat['bb_w'] = (bb.bollinger_hband() - bb.bollinger_lband()).bfill()
+df_feat['returns'] = df_feat['close'].pct_change().fillna(0)
+df_feat['vol_norm'] = (df_feat['volume'] - df_feat['volume'].rolling(20).mean()).fillna(0)
+df_feat = df_feat.dropna().reset_index(drop=True)
+
+# Windowed features
+WINDOW = SEQ_LEN
+rows = []
+for i in range(WINDOW, len(df_feat)):
+    win = df_feat.iloc[i-WINDOW:i]
+    row = {
+        'dt': df_feat['datetime'].iloc[i],
+        'close_mean': win['close'].mean(),
+        'close_std': win['close'].std(),
+        'vol_sum': win['volume'].sum(),
+        'ret_mean': win['returns'].mean(),
+        'rsi_mean': win['rsi'].mean(),
+        'bbw_mean': win['bb_w'].mean(),
+        'is_injected_fraud': int(df_feat['is_injected_fraud'].iloc[i])
+    }
+    rows.append(row)
+df_window = pd.DataFrame(rows).reset_index(drop=True)
+
+X = df_window[['close_mean','close_std','vol_sum','ret_mean','rsi_mean','bbw_mean']].values
+scaler = StandardScaler()
+Xs = scaler.fit_transform(X)
+
+# Isolation Forest
+iso = IsolationForest(contamination=CONTAMINATION, random_state=RANDOM_SEED)
+iso.fit(Xs)
+scores_if = -iso.decision_function(Xs)
+
+# LSTM Autoencoder
+X_lstm = Xs.reshape((Xs.shape[0], Xs.shape[1], 1))
+lstm_model = Sequential([
+    LSTM(32, activation='relu', input_shape=(X_lstm.shape[1], 1)),
+    Dense(X_lstm.shape[1])
+])
+lstm_model.compile(optimizer='adam', loss='mse')
+lstm_model.fit(X_lstm, X_lstm, epochs=20, batch_size=16, verbose=0)
+recon = lstm_model.predict(X_lstm)
+scores_lstm = np.mean((X_lstm[:,:,0] - recon)**2, axis=1)
+
+df_window['score_if'] = scores_if
+df_window['score_lstm'] = scores_lstm
+
+# Thresholds
+df_window['threshold_percentile_if'] = np.percentile(scores_if, 97.5)
+df_window['threshold_zscore_if'] = scores_if.mean() + 2.5*scores_if.std()
+df_window['rolling_mean_if'] = pd.Series(scores_if).rolling(ROLLING_WINDOW).mean()
+df_window['rolling_std_if'] = pd.Series(scores_if).rolling(ROLLING_WINDOW).std()
+df_window['threshold_rolling_if'] = df_window['rolling_mean_if'] + 2.5*df_window['rolling_std_if']
+
+df_feat[['datetime','open','high','low','close','volume','is_injected_fraud']].to_csv("full_sim_prices.csv", index=False)
+df_window.to_csv("streamlit_sim_data.csv", index=False)
+
+# Streamlit app code
+app_code = f"""
+import streamlit as st
+import pandas as pd
+import numpy as np
+import plotly.graph_objects as go
+import time
+
+DATA_WINDOW = "streamlit_sim_data.csv"
+PRICE_CSV = "full_sim_prices.csv"
+
+st.set_page_config(layout="wide", page_title="Crypto Fraud Detection Dashboard")
+st.title("🚨 Crypto Fraud Detection — Simulation Demo")
+
+col1, col2, col3 = st.columns([1,1,1])
+with col1:
+    speed = st.slider("Playback speed (seconds per step)", 0.05, 2.0, value={PLAYBACK_SPEED}, step=0.05)
+with col2:
+    model_choice = st.selectbox("Select Model", ["Isolation Forest", "LSTM"])
+with col3:
+    threshold_method = st.selectbox("Select Threshold Method", ["Percentile", "Z-score", "Rolling"])
+
+with st.sidebar:
+    start = st.button("Start Simulation")
+
+df_win = pd.read_csv(DATA_WINDOW, parse_dates=['dt'])
+df_price = pd.read_csv(PRICE_CSV, parse_dates=['datetime'])
+
+if model_choice=="Isolation Forest":
+    score_col = 'score_if'
+    if threshold_method=="Percentile":
+        thr = df_win['threshold_percentile_if'].iloc[0]
+    elif threshold_method=="Z-score":
+        thr = df_win['threshold_zscore_if'].iloc[0]
+    else:
+        thr = df_win['threshold_rolling_if']
+else:
+    score_col = 'score_lstm'
+    # LSTM thresholds can be same as IF for simplicity
+    thr = np.percentile(df_win[score_col], 97.5) if threshold_method=="Percentile" else df_win[score_col].mean() + 2.5*df_win[score_col].std()
+
+df_win['is_alert_dynamic'] = df_win[score_col] > thr
+
+price_col, info_col = st.columns([2,1])
+with price_col:
+    st.subheader("Price chart (with model alerts)")
+    price_chart = st.empty()
+    total = len(df_win)
+    cursor = 0
+    while True:
+        if cursor >= total:
+            st.info("Simulation finished — restart to run again.")
+            break
+        cur_dt = df_win['dt'].iloc[cursor]
+        window_start = df_price['datetime'].iloc[max(0, cursor - 24*7)]
+        window_end = df_price['datetime'].iloc[min(len(df_price)-1, cursor + 12)]
+        view = df_price[(df_price['datetime'] >= window_start) & (df_price['datetime'] <= window_end)]
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(x=view['datetime'], y=view['close'], mode='lines', name='Price'))
+        gt_view = df_price[(df_price['datetime'] >= window_start) & (df_price['datetime'] <= window_end) & (df_price['is_injected_fraud']==1)]
+        if len(gt_view) > 0:
+            fig.add_trace(go.Scatter(x=gt_view['datetime'], y=gt_view['close'], mode='markers', name='Injected Fraud (GT)'))
+        alerts_up_to_now = df_win[(df_win['is_alert_dynamic']==True) & (df_win['dt'] <= cur_dt)]
+        if len(alerts_up_to_now) > 0:
+            alert_times = alerts_up_to_now['dt'].tolist()
+            alert_prices = []
+            for at in alert_times:
+                nearest = df_price.iloc[(df_price['datetime'] - pd.to_datetime(at)).abs().argsort()[:1]]
+                alert_prices.append(nearest['close'].values[0])
+            fig.add_trace(go.Scatter(x=alert_times, y=alert_prices, mode='markers', name='Model Alerts'))
+        fig.update_layout(height=600, margin={{"r":0,"t":30,"l":0,"b":0}})
+        price_chart.plotly_chart(fig, use_container_width=True)
+        cursor += 1
+        time.sleep(speed)
+
+with info_col:
+    st.subheader("Model & Alerts")
+    st.write("Model:", model_choice)
+    st.write("Threshold method:", threshold_method)
+    st.write("Total windows:", len(df_win))
+    st.write("Total dynamic alerts:", int(df_win['is_alert_dynamic'].sum()))
+    st.subheader("Recent Alerts (table)")
+    recent_alerts = df_win[df_win['is_alert_dynamic']==True].sort_values('dt', ascending=False).head(10)
+    st.dataframe(recent_alerts[['dt','anomaly_score','is_injected_fraud']].rename(columns={{'dt':'datetime'}}))
+"""
+
+with open("app.py", "w") as f:
+    f.write(app_code)
+
+try: ngrok.kill()
+except: pass
+
+os.environ["STREAMLIT_SERVER_HEADLESS"] = "true"
+os.environ["STREAMLIT_BROWSER_GALLERY"] = "false"
+os.environ["STREAMLIT_BROWSER_SERVER_ADDRESS"] = "127.0.0.1"
+
+NGROK_AUTH_TOKEN = "31Ecjc9XKs71emAe3pDtgz1H0Db_6vUMxYjF1kXsSarm5Fraf"
+ngrok.set_auth_token(NGROK_AUTH_TOKEN)
+
+get_ipython().system_raw("streamlit run app.py &")
+public_url = ngrok.connect(8501).public_url
+print("Dashboard URL:", public_url)
