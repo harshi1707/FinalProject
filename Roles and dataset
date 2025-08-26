@@ -1,0 +1,76 @@
+
+
+👨‍💻 Harshitha (Sequential Models: LSTM, GRU, Transformers)
+Models Assigned:
+
+LSTM – Baseline sequential forecasting
+
+GRU – Lightweight sequence predictor
+
+Autoencoder – Fraud anomaly detection
+
+Deep Q-Network (DQN) – RL for discrete token release
+
+🔹 Needs time-series transaction + market data.
+
+Credit Card Fraud (Kaggle) – highly imbalanced fraud detection dataset (benchmark).
+
+Yahoo Finance / Binance OHLCV (via API) – price time series to test allocation stability.
+
+Use case: Predict future frauds/imbalances in token allocation from sequences.
+✅Dataset:
+https://www.kaggle.com/datasets/mlg-ulb/creditcardfraud
+https://console.cloud.google.com/marketplace/product/ethereum/crypto-ethereum-blockchain
+https://www.kaggle.com/datasets/ealaxi/paysim1
+
+
+👩‍💻 Nandini(Graph Models: GNN, GraphSAGE)
+Role: Graph Modeling Specialist (wallet-to-wallet relationships, fraud networks)
+
+Models Assigned:
+
+Graph Neural Network (GNN) – Basic wallet graph analysis
+
+Graph Attention Network (GAT) – Detecting whale/collusion influence
+
+Temporal GNN (TGN/TGAT) – Dynamic graph modeling for evolving fraud
+
+Hybrid (GNN + Transformer) – Joint modeling of graph + sequence
+🔹 Needs graph-structured data (wallets as nodes, transactions as edges).
+
+Elliptic Dataset (Bitcoin Transaction Graph, Kaggle/Cambridge) – best for fraud detection with graphs.
+
+Ethereum BigQuery (graph features: wallet-to-wallet Tx).
+
+Use case: Detect fraud patterns, whale manipulation, clustering wallets.
+✅Dataset:
+https://www.kaggle.com/datasets/ellipticco/elliptic-data-set
+https://console.cloud.google.com/marketplace/product/ethereum/crypto-ethereum-blockchain
+https://snap.stanford.edu/data/soc-sign-bitcoin-otc.html
+
+
+
+👩‍💻 Thanushri(Anomaly Detection Models: Autoencoders, Isolation Forest, Hybrid Models)
+Role: Optimization & Deployment Specialist (market simulation + decision-making)
+
+Models Assigned:
+
+Transformers (TFT, Informer, FEDformer) – Long-horizon prediction
+
+Proximal Policy Optimization (PPO) – Continuous action RL
+
+Advantage Actor-Critic (A3C) – Parallelized RL baseline
+
+Soft Actor-Critic (SAC) – Stochastic continuous optimization
+
+🔹 Needs transaction outlier data.
+
+Credit Card Fraud Dataset (Kaggle) – strong base for anomaly model benchmarking.
+✅Dataset:
+https://console.cloud.google.com/marketplace/product/ethereum/crypto-ethereum-blockchain
+https://console.cloud.google.com/marketplace/product/ethereum/crypto-ethereum-blockchain
+https://snap.stanford.edu/data/soc-sign-bitcoin-otc.html
+
+Ethereum BigQuery (Tx outlier detection: sudden bursts, unusual gas, whale moves).
+
+Use case: Show fraud alerts in simulation dashboard (deep learning autoencoder vs rule-based).
