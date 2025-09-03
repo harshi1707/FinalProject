@@ -1,0 +1,267 @@
+# streamlit_app.py
+import os, math, inspect
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn.functional as F
+import streamlit as st
+from torch_geometric.nn import SAGEConv, GATConv
+from torch_geometric.utils import k_hop_subgraph
+from sklearn.metrics import average_precision_score, roc_auc_score
+from torch_geometric.datasets import EllipticBitcoinDataset
+
+# ----------------------
+# Sidebar config
+# ----------------------
+st.sidebar.title("🔎 Fraud Detection with GNN + Temporal Models")
+model_name = st.sidebar.selectbox("Select GNN Model", ["GraphSAGE (baseline)", "GAT (influence)"])
+temporal_model = st.sidebar.selectbox("Temporal Model", ["None", "LSTM", "GRU", "Transformer"])
+fuse_toggle = st.sidebar.checkbox("Enable Fusion with Temporal Embeddings", True)
+seq_len = st.sidebar.slider("Time series length", 50, 500, 100)
+k_top = st.sidebar.slider("Top suspicious nodes", 5, 50, 10)
+khop = st.sidebar.slider("Neighborhood hops", 1, 3, 2)
+score_thr = st.sidebar.slider("Alert threshold", 0.1, 0.9, 0.5)
+show_attn = st.sidebar.checkbox("Show GAT attention", False)
+
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+# ----------------------
+# Models
+# ----------------------
+class SageNet(torch.nn.Module):
+    def __init__(self, in_dim, hid=128, out=2):
+        super().__init__()
+        self.c1 = SAGEConv(in_dim, hid)
+        self.c2 = SAGEConv(hid, hid)
+        self.out = torch.nn.Linear(hid, out)
+    def forward(self, x, ei):
+        x = F.relu(self.c1(x, ei))
+        x = F.dropout(x, 0.5, training=self.training)
+        x = F.relu(self.c2(x, ei))
+        return self.out(x)
+
+class GATNet(torch.nn.Module):
+    def __init__(self, in_dim, hid=64, heads=4, out=2):
+        super().__init__()
+        self.g1 = GATConv(in_dim, hid, heads=heads, dropout=0.4)
+        self.g2 = GATConv(hid*heads, hid, heads=1, dropout=0.4)
+        self.out = torch.nn.Linear(hid, out)
+    def forward(self, x, ei, return_attention=False):
+        if return_attention:
+            h1, attn1 = self.g1(x, ei, return_attention_weights=True)
+            h1 = F.elu(h1); h1 = F.dropout(h1, 0.5, training=self.training)
+            h2, attn2 = self.g2(h1, ei, return_attention_weights=True)
+            logits = self.out(h2)
+            return logits, (attn1, attn2)
+        h1 = F.elu(self.g1(x, ei))
+        h1 = F.dropout(h1, 0.5, training=self.training)
+        h2 = self.g2(h1, ei)
+        return self.out(h2)
+
+class LSTMEncoder(torch.nn.Module):
+    def __init__(self, in_dim, hid=64, nlayers=1, bidir=False):
+        super().__init__()
+        self.lstm = torch.nn.LSTM(in_dim, hid, nlayers, batch_first=True, bidirectional=bidir)
+        self.out_dim = hid * (2 if bidir else 1)
+    def forward(self, x):
+        out, (h, c) = self.lstm(x)
+        if self.lstm.bidirectional:
+            return torch.cat([h[-2], h[-1]], dim=-1)
+        else:
+            return h[-1]
+
+class GRUEncoder(torch.nn.Module):
+    def __init__(self, in_dim, hid=64, nlayers=1, bidir=False):
+        super().__init__()
+        self.gru = torch.nn.GRU(in_dim, hid, nlayers, batch_first=True, bidirectional=bidir)
+        self.out_dim = hid * (2 if bidir else 1)
+    def forward(self, x):
+        out, h = self.gru(x)
+        if self.gru.bidirectional:
+            return torch.cat([h[-2], h[-1]], dim=-1)
+        else:
+            return h[-1]
+
+class TransformerEncoderSmall(torch.nn.Module):
+    def __init__(self, in_dim, model_dim=64, nhead=4, nlayers=2):
+        super().__init__()
+        self.proj = torch.nn.Linear(in_dim, model_dim)
+        enc_layer = torch.nn.TransformerEncoderLayer(d_model=model_dim, nhead=nhead, batch_first=True)
+        self.encoder = torch.nn.TransformerEncoder(enc_layer, num_layers=nlayers)
+        self.cls = torch.nn.Parameter(torch.randn(1,1,model_dim)*0.01)
+        self.out_dim = model_dim
+    def forward(self, x):
+        B = x.size(0)
+        x = self.proj(x)
+        cls = self.cls.expand(B, -1, -1)
+        x = torch.cat([cls, x], dim=1)
+        x = self.encoder(x)
+        return x[:,0]
+
+class FiLMFusionModule(torch.nn.Module):
+    def __init__(self, node_dim, temp_dim):
+        super().__init__()
+        self.gamma = torch.nn.Linear(temp_dim, node_dim)
+        self.beta  = torch.nn.Linear(temp_dim, node_dim)
+    def forward(self, node_x, temp_emb):
+        gamma = self.gamma(temp_emb).unsqueeze(0)
+        beta  = self.beta(temp_emb).unsqueeze(0)
+        return node_x * (1 + gamma) + beta
+
+# ----------------------
+# Load dataset
+# ----------------------
+@st.cache_resource(show_spinner=True)
+def load_elliptic():
+    ds = EllipticBitcoinDataset(root="data/elliptic")
+    d = ds[0]
+    y = d.y.numpy()
+    known = y != 0
+    labels = (y == 2).astype(int)
+    idx = np.where(known)[0]; rng = np.random.RandomState(42); rng.shuffle(idx)
+    n = len(idx)
+    tr = np.zeros(d.num_nodes, bool); va = np.zeros(d.num_nodes, bool); te = np.zeros(d.num_nodes, bool)
+    tr[idx[:int(.7*n)]] = True; va[idx[int(.7*n):int(.85*n)]] = True; te[idx[int(.85*n):]] = True
+    meta = dict(num_nodes=int(d.num_nodes), num_edges=int(d.edge_index.shape[1]))
+    return d, labels, tr, va, te, meta
+
+data, labels, train_mask, val_mask, test_mask, meta = load_elliptic()
+
+# ----------------------
+# Temporal embedding (real OHLCV can replace synthetic)
+# ----------------------
+def get_global_series(length):
+    t = np.arange(length)
+    close = 10000 + np.cumsum(np.random.normal(0, 1, size=length))
+    vol = np.random.uniform(1,10,size=length)
+    series = np.stack([
+        (close - close.mean())/ (close.std()+1e-9),
+        (vol - vol.mean())/(vol.std()+1e-9)
+    ], axis=-1)
+    return torch.tensor(series, dtype=torch.float32).unsqueeze(0)
+
+def make_temporal_encoder(kind, in_dim, hid=64):
+    if kind == "LSTM": return LSTMEncoder(in_dim, hid=hid).to(device)
+    if kind == "GRU": return GRUEncoder(in_dim, hid=hid).to(device)
+    if kind == "Transformer": return TransformerEncoderSmall(in_dim, model_dim=hid).to(device)
+    return None
+
+# ----------------------
+# Build GNN + Fusion
+# ----------------------
+def build_gnn_with_optional_fusion(model_name, node_feat_dim, temp_emb_dim=None):
+    if model_name == "GraphSAGE (baseline)": gnn = SageNet(in_dim=node_feat_dim)
+    else: gnn = GATNet(in_dim=node_feat_dim)
+    film = FiLMFusionModule(node_dim=node_feat_dim, temp_dim=temp_emb_dim) if temp_emb_dim else None
+    return gnn, film
+
+node_feat_dim = data.num_node_features
+temp_encoder = make_temporal_encoder(temporal_model, in_dim=2, hid=64) if temporal_model!="None" and fuse_toggle else None
+temp_dim = temp_encoder.out_dim if temp_encoder else None
+gnn, film_module = build_gnn_with_optional_fusion(model_name, node_feat_dim, temp_dim)
+
+gnn, film_module, temp_encoder = gnn.to(device), (film_module.to(device) if film_module else None), (temp_encoder.to(device) if temp_encoder else None)
+
+# Temporal embedding
+if fuse_toggle and temp_encoder:
+    series = get_global_series(seq_len).to(device)
+    with torch.no_grad():
+        temp_emb = temp_encoder(series)
+    temp_emb = temp_emb.squeeze(0).cpu()
+else:
+    temp_emb = None
+
+# ----------------------
+# Run inference
+# ----------------------
+def run_inference(gnn_model, film_mod, temp_emb, return_attention=False):
+    x = data.x.clone().float().to(device)
+    if film_mod and temp_emb is not None:
+        with torch.no_grad():
+            x = film_mod(x, temp_emb.to(device))
+    gnn_model.eval()
+    with torch.no_grad():
+        if return_attention and "return_attention" in inspect.signature(gnn_model.forward).parameters:
+            logits, att = gnn_model(x, data.edge_index, return_attention=True)
+            probs = torch.softmax(logits, dim=1)[:,1].cpu().numpy()
+            return probs, att
+        else:
+            logits = gnn_model(x, data.edge_index)
+            probs = torch.softmax(logits, dim=1)[:,1].cpu().numpy()
+            return probs, None
+
+probs, attns = run_inference(gnn, film_module, temp_emb, return_attention=(model_name=="GAT (influence)" and show_attn))
+
+# ----------------------
+# Results
+# ----------------------
+df_rank = pd.DataFrame({
+    "node_id": np.arange(data.num_nodes),
+    "prob_illicit": probs,
+    "label": labels
+})
+df_rank["is_alert"] = df_rank["prob_illicit"] >= score_thr
+df_rank = df_rank.sort_values("prob_illicit", ascending=False)
+
+c1, c2, c3, c4 = st.columns(4)
+c1.metric("Nodes", f"{int(meta['num_nodes']):,}")
+c2.metric("Edges", f"{int(meta['num_edges']):,}")
+c3.metric("Illicit (labels)", f"{int((labels==1).sum()):,}")
+c4.metric("Licit (labels)", f"{int((labels==0).sum()):,}")
+
+# Test metrics
+test_idx = np.where(test_mask)[0]
+if len(test_idx)>0:
+    ap = average_precision_score(labels[test_idx], probs[test_idx])
+    auc = roc_auc_score(labels[test_idx], probs[test_idx])
+    st.write(f"**Test AUPRC:** {ap:.4f} &nbsp;&nbsp; **Test AUC:** {auc:.4f}")
+
+# Node ranking
+left, right = st.columns([2,1])
+with left:
+    st.subheader("Top suspicious nodes")
+    st.dataframe(df_rank.head(k_top), width='stretch', height=420)
+with right:
+    st.subheader("Investigate a node")
+    default_node = int(df_rank.head(k_top).iloc[0]["node_id"]) if len(df_rank)>0 else 0
+    node_id = st.number_input("Node ID", min_value=0, max_value=int(data.num_nodes-1), value=default_node, step=1)
+    st.write("Score:", float(probs[node_id]))
+    st.write("Label (if known):", int(labels[node_id]))
+
+# Subgraph visualization
+st.subheader("Neighborhood subgraph")
+subset, edge_index, mapping, edge_mask = k_hop_subgraph(node_id, khop, data.edge_index, relabel_nodes=True)
+sub_nodes = pd.DataFrame({"node": subset.numpy()})
+src, dst = edge_index[0].numpy(), edge_index[1].numpy()
+edge_df = pd.DataFrame({"src": subset.numpy()[src], "dst": subset.numpy()[dst], "w": 1.0})
+
+if attns is not None and show_attn:
+    try:
+        _, att2 = attns
+        alpha = att2[1].detach().cpu().numpy().flatten()
+        if len(alpha)==len(edge_df):
+            a = (alpha - alpha.min()) / (alpha.ptp() + 1e-9)
+            edge_df["w"] = 1.0 + 7.0*a
+    except Exception: pass
+
+st.write("Nodes in subgraph:", len(sub_nodes), "Edges:", len(edge_df))
+st.dataframe(edge_df.head(50), width='stretch', height=240)
+
+# Downloads
+sub_nodes.to_csv("subgraph_nodes.csv", index=False)
+edge_df.to_csv("subgraph_edges.csv", index=False)
+st.download_button("Download subgraph nodes CSV", data=open("subgraph_nodes.csv","rb"), file_name="subgraph_nodes.csv")
+st.download_button("Download subgraph edges CSV", data=open("subgraph_edges.csv","rb"), file_name="subgraph_edges.csv")
+
+# Temporal embedding info
+if fuse_toggle and temp_emb is not None:
+    st.sidebar.markdown("**Temporal Embedding**")
+    st.sidebar.write("Temporal model:", temporal_model)
+    st.sidebar.write("Embedding dim:", int(temp_emb.shape[0]))
+    st.sidebar.write("First 8 dims:", np.round(temp_emb.numpy()[:8],3))
+else:
+    st.sidebar.write("No temporal fusion applied.")
+
+pip install torch torch-geometric streamlit scikit-learn pandas
+
+streamlit run streamlit_app.py
